@@ -1,5 +1,4 @@
 
-
 name: F-Tech Shorts
 
 on:
@@ -54,3 +53,4 @@ jobs:
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
         run: python app.py
+        

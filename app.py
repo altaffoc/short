@@ -343,8 +343,26 @@ def main():
         print("Durasi:", round(duration, 2), "detik")
         print("Halaman footage:", footage["page_url"])
 
+    
+    # Simpan riwayat setelah video berhasil dibuat.
+    history.setdefault("used_articles", [])
+    history.setdefault("used_scripts", [])
+
+    if news["key"] not in history["used_articles"]:
+        history["used_articles"].append(news["key"])
+
+    if script_key not in history["used_scripts"]:
+        history["used_scripts"].append(script_key)
+
+    # Batasi ukuran riwayat agar file tidak membesar tanpa batas.
+    history["used_articles"] = history["used_articles"][-500:]
+    history["used_scripts"] = history["used_scripts"][-500:]
+
+    save_history(history)
+    print("Riwayat artikel dan narasi berhasil diperbarui.")
+
     if DRY_RUN:
-        print("MODE UJI: belum mengunggah video ke YouTube.")
+        print("MODE UJI: video belum diunggah ke YouTube.")
         return
 
     raise RuntimeError(

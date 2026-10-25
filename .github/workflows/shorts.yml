@@ -5,18 +5,16 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Test only, do not upload"
+        description: "Test only; do not upload"
         required: true
         default: "true"
         type: choice
         options:
           - "true"
           - "false"
-  schedule:
-    - cron: "17 2,5,8,11,14,17 * * *"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ftech-shorts
@@ -31,7 +29,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -41,16 +39,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run F-Tech automation
+      - name: Validate configuration
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+        run: |
+          python -c "import os; assert os.getenv('GEMINI_API_KEY'), 'GEMINI_API_KEY missing'; assert os.getenv('PIXABAY_API_KEY'), 'PIXABAY_API_KEY missing'; print('Required secrets are present.')"
+
+      - name: Generate video
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          GEMINI_MODEL: gemini-2.5-flash
+          TTS_VOICE: id-ID-ArdiNeural
+          DRY_RUN: ${{ inputs.dry_run || 'true' }}
         run: python app.py
-        

@@ -711,4 +711,22 @@ def main():
     remember(history, "used_titles", title_key)
     save_history(history)
 
-    log.info("Video selesa
+    log.info("Video selesai dibuat: %s", final_path)
+    log.info("Metadata selesai dibuat: %s", metadata_path)
+    log.info("Durasi video: %.2f detik", duration)
+
+    if DRY_RUN:
+        log.info(
+            "DRY RUN aktif. Video belum diunggah ke YouTube."
+        )
+        return
+
+    raise RuntimeError(
+        "Upload YouTube belum diaktifkan. "
+        "Gunakan DRY_RUN=true sampai OAuth dan uploader "
+        "sudah disiapkan serta diuji."
+    )
+
+
+if __name__ == "__main__":
+    main()

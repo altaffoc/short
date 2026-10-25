@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Test only; do not upload"
+        description: "Test only; do not upload to YouTube"
         required: true
         default: "true"
         type: choice
@@ -14,7 +14,7 @@ on:
           - "false"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ftech-shorts
@@ -59,3 +59,25 @@ jobs:
           TTS_VOICE: id-ID-ArdiNeural
           DRY_RUN: ${{ inputs.dry_run || 'true' }}
         run: python app.py
+
+      - name: Save history to repository
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update F-Tech anti-duplication history"
+            git push
+          else
+            echo "No history changes to commit."
+          fi
+
+      - name: Upload generated video and metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ftech-shorts-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7

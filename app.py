@@ -30,9 +30,19 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "").strip()
 
+
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL", "gemini-3.8-flash"
 ).strip()
+
+GEMINI_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-3.6-flash,gemini-3.5-flash-lite"
+    ).split(",")
+    if model.strip()
+]
 
 TTS_VOICE = os.getenv("TTS_VOICE", "id-ID-ArdiNeural")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"

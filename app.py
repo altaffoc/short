@@ -1,57 +1,47 @@
 
 import os
-import json
 import re
+import json
+import hashlib
 import subprocess
+import asyncio
 import tempfile
 from pathlib import Path
+from datetime import datetime, timezone
 
 import feedparser
 import requests
 import edge_tts
 
-# ==================================================
-# F-TECH SHORTS — KONFIGURASI
-# ==================================================
+ROOT = Path(__file__).resolve().parent
+OUTPUT_DIR = ROOT / "output"
+HISTORY_FILE = ROOT / "history.json"
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
-DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
-
-HISTORY_FILE = Path("history.json")
-OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "")
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+TTS_VOICE = os.getenv("TTS_VOICE", "id-ID-ArdiNeural")
 
 RSS_FEEDS = [
     "https://blog.google/technology/ai/rss/",
     "https://techcrunch.com/category/artificial-intelligence/feed/",
 ]
 
-VOICE = "id-ID-ArdiNeural"
-MODEL = "gemini-2.5-flash"
-
-
-def check_configuration():
-    if not GEMINI_API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY belum diatur di GitHub Secrets."
-        )
-
-    if not PEXELS_API_KEY:
-        raise RuntimeError(
-            "PEXELS_API_KEY belum diatur di GitHub Secrets."
-        )
-
-
 def load_history():
     if not HISTORY_FILE.exists():
-        return []
+        return {"used_articles": [], "used_scripts": []}
 
     try:
-        return json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return {"used_articles": data, "used_scripts": []}
+        return data
     except (json.JSONDecodeError, OSError):
-        return []
-
+        return {"used_articles": [], "used_scripts": []}
 
 def save_history(history):
     HISTORY_FILE.write_text(
@@ -59,217 +49,262 @@ def save_history(history):
         encoding="utf-8",
     )
 
+def fingerprint(text):
+    normalized = re.sub(r"\W+", " ", text.lower()).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-def get_news():
-    history = load_history()
+def get_news(history):
+    used = set(history.get("used_articles", []))
     candidates = []
 
     for feed_url in RSS_FEEDS:
         try:
             feed = feedparser.parse(feed_url)
 
-            for entry in feed.entries[:15]:
+            for entry in feed.entries[:20]:
                 title = entry.get("title", "").strip()
                 link = entry.get("link", "").strip()
                 summary = re.sub(
-                    r"<[^>]+>",
-                    " ",
-                    entry.get("summary", ""),
+                    r"<[^>]+>", " ", entry.get("summary", "")
                 ).strip()
 
-                if title and link and link not in history:
+                if not title or not link.startswith("https://"):
+                    continue
+
+                key = fingerprint(link)
+
+                if key not in used:
                     candidates.append({
                         "title": title,
                         "link": link,
-                        "summary": summary[:1800],
+                        "summary": summary[:2500],
+                        "key": key,
                     })
         except Exception as exc:
-            print(f"Gagal membaca RSS: {exc}")
+            print(f"RSS tidak bisa dibaca: {exc}")
 
     if not candidates:
         raise RuntimeError(
-            "Tidak ditemukan berita baru. Coba lagi pada jadwal berikutnya."
+            "Tidak ditemukan artikel baru yang belum digunakan."
         )
 
+    # Pilih artikel terbaru berdasarkan urutan feed.
     return candidates[0]
 
-
-def generate_script(news):
+def generate_script(news, history):
     prompt = f"""
-Kamu adalah penulis naskah YouTube Shorts untuk channel
-teknologi Indonesia bernama F-Tech.
+Kamu adalah editor teknologi untuk channel YouTube Shorts F-Tech.
+Buat naskah orisinal dalam Bahasa Indonesia, sekitar 75-110 kata,
+untuk video 30-60 detik.
 
-Gunakan berita berikut sebagai bahan:
-Judul: {news['title']}
+Gunakan informasi yang didukung oleh bahan sumber di bawah.
+Jangan mengarang angka, tanggal, hasil riset, atau kutipan.
+Jika bahan tidak cukup untuk memastikan suatu klaim, jangan
+menyatakannya sebagai fakta. Bedakan pengumuman perusahaan dari
+hasil yang telah diverifikasi secara independen.
+
+Judul sumber: {news['title']}
 Ringkasan sumber: {news['summary']}
 URL sumber: {news['link']}
 
-Buat naskah bahasa Indonesia yang menarik dan mudah dipahami.
-Jangan mengarang fakta yang tidak didukung sumber.
-Jika informasi tidak cukup, gunakan bahasa yang berhati-hati.
-Hindari klaim sensasional dan jangan menyalin artikel mentah.
+Buat visual_query bahasa Inggris yang secara spesifik menggambarkan
+objek atau teknologi dalam cerita. Hindari pencarian umum seperti
+"technology" jika topiknya sebenarnya perangkat tertentu.
 
-Narasi harus cocok untuk video sekitar 30 sampai 60 detik.
-Targetkan sekitar 75 sampai 110 kata.
-Buat judul Shorts singkat dan relevan.
-Buat visual_query berbahasa Inggris untuk mencari video stok
-yang relevan di Pexels.
-Hashtags maksimal 5 buah.
-
-Balas HANYA JSON valid dengan struktur:
+Buat maksimal 5 hashtag yang relevan.
+Balas hanya JSON valid:
 {{
-  "title": "judul video",
+  "title": "judul Shorts",
   "narration": "naskah narasi",
-  "visual_query": "kata pencarian video stok",
-  "hashtags": "#Teknologi #AI"
+  "visual_query": "specific visual search terms in English",
+  "hashtags": ["#Teknologi", "#FTech"]
 }}
 """
 
-    response = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{MODEL}:generateContent",
-        params={"key": GEMINI_API_KEY},
-        json={
-            "contents": [
-                {"parts": [{"text": prompt}]}
-            ],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "temperature": 0.4,
-            },
-        },
-        timeout=60,
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{GEMINI_MODEL}:generateContent"
     )
 
+    response = requests.post(
+        url,
+        params={"key": GEMINI_API_KEY},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.4,
+                "responseMimeType": "application/json",
+            },
+        },
+        timeout=90,
+    )
     response.raise_for_status()
-    data = response.json()
 
+    data = response.json()
     text = data["candidates"][0]["content"]["parts"][0]["text"]
     script = json.loads(text)
 
-    narration = script["narration"].strip()
-    words = narration.split()
+    for field in ("title", "narration", "visual_query", "hashtags"):
+        if field not in script:
+            raise RuntimeError(f"Kolom AI tidak tersedia: {field}")
 
+    words = script["narration"].split()
     if not 65 <= len(words) <= 135:
         raise RuntimeError(
-            f"Panjang narasi {len(words)} kata; perlu diperbaiki."
+            f"Naskah berisi {len(words)} kata; target 65-135 kata."
         )
 
-    return script
+    script_key = fingerprint(script["narration"])
+    if script_key in set(history.get("used_scripts", [])):
+        raise RuntimeError("Narasi terdeteksi duplikat.")
 
+    return script, script_key
 
-def download_pexels_video(query, destination):
+def find_pixabay_video(query, destination):
+    if not PIXABAY_API_KEY:
+        raise RuntimeError("PIXABAY_API_KEY belum diatur.")
+
     response = requests.get(
-        "https://api.pexels.com/videos/search",
-        headers={"Authorization": PEXELS_API_KEY},
+        "https://pixabay.com/api/videos/",
         params={
-            "query": query,
-            "orientation": "portrait",
-            "per_page": 10,
+            "key": PIXABAY_API_KEY,
+            "q": query,
+            "video_type": "film",
+            "orientation": "vertical",
+            "safesearch": "true",
+            "per_page": 20,
         },
         timeout=45,
     )
     response.raise_for_status()
+    data = response.json()
 
-    videos = response.json().get("videos", [])
-    if not videos:
-        raise RuntimeError(
-            "Video stok tidak ditemukan. Coba kata pencarian lain."
+    hits = data.get("hits", [])
+    if not hits:
+        # Coba lagi tanpa batasan orientasi jika tidak ada hasil vertikal.
+        response = requests.get(
+            "https://pixabay.com/api/videos/",
+            params={
+                "key": PIXABAY_API_KEY,
+                "q": query,
+                "safesearch": "true",
+                "per_page": 20,
+            },
+            timeout=45,
         )
+        response.raise_for_status()
+        hits = response.json().get("hits", [])
 
-    for video in videos:
-        files = sorted(
-            video.get("video_files", []),
-            key=lambda item: item.get("width", 0),
-            reverse=True,
-        )
+    for hit in hits:
+        videos = hit.get("videos", {})
 
-        for item in files:
-            link = item.get("link")
-            if not link:
+        # Pilih ukuran yang cukup baik, dengan fallback.
+        for size in ("large", "medium", "small", "tiny"):
+            item = videos.get(size, {})
+            video_url = item.get("url")
+
+            if not video_url:
                 continue
 
             try:
-                result = requests.get(link, timeout=90)
-                result.raise_for_status()
+                with requests.get(
+                    video_url, stream=True, timeout=90
+                ) as download:
+                    download.raise_for_status()
 
-                if len(result.content) < 100_000:
-                    continue
+                    total = 0
+                    with destination.open("wb") as output:
+                        for chunk in download.iter_content(1024 * 1024):
+                            if chunk:
+                                output.write(chunk)
+                                total += len(chunk)
 
-                destination.write_bytes(result.content)
-                return
+                if total >= 50_000:
+                    return {
+                        "video_id": hit.get("id"),
+                        "page_url": hit.get("pageURL", ""),
+                        "tags": hit.get("tags", ""),
+                    }
+
+                destination.unlink(missing_ok=True)
             except requests.RequestException:
+                destination.unlink(missing_ok=True)
                 continue
 
-    raise RuntimeError("Tidak berhasil mengunduh video stok.")
-
+    raise RuntimeError(
+        "Video Pixabay tidak berhasil ditemukan atau diunduh."
+    )
 
 async def create_voice(text, destination):
-    communicate = edge_tts.Communicate(text, VOICE)
-    await communicate.save(str(destination))
+    speech = edge_tts.Communicate(text, TTS_VOICE)
+    await speech.save(str(destination))
 
-
-def render_video(video_path, audio_path, destination):
-    command = [
-        "ffmpeg", "-y",
-        "-stream_loop", "-1",
-        "-i", str(video_path),
-        "-i", str(audio_path),
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-vf",
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,setsar=1",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "24",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-shortest",
-        "-movflags", "+faststart",
-        str(destination),
-    ]
-
-    subprocess.run(command, check=True)
-
-    duration = float(subprocess.check_output([
-        "ffprobe",
-        "-v", "error",
+def get_audio_duration(audio_path):
+    result = subprocess.check_output([
+        "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
-        str(destination),
-    ], text=True).strip())
+        str(audio_path),
+    ], text=True)
+
+    return float(result.strip())
+
+def render_video(video_path, audio_path, destination):
+    duration = get_audio_duration(audio_path)
 
     if not 30 <= duration <= 60:
         raise RuntimeError(
-            f"Durasi video {duration:.1f} detik, di luar target 30–60 detik."
+            f"Durasi narasi {duration:.1f} detik, di luar target 30-60."
         )
 
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-stream_loop", "-1", "-i", str(video_path),
+        "-i", str(audio_path),
+        "-t", str(duration),
+        "-vf",
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,setsar=1",
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", "24", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-shortest", "-movflags", "+faststart",
+        str(destination),
+    ], check=True)
+
+    return duration
 
 def main():
-    check_configuration()
-    news = get_news()
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY belum diatur.")
 
-    print("Berita terpilih:", news["title"])
-    print("Sumber:", news["link"])
+    if not PIXABAY_API_KEY:
+        raise RuntimeError("PIXABAY_API_KEY belum diatur.")
 
-    script = generate_script(news)
+    history = load_history()
+    news = get_news(history)
+
+    print("Artikel:", news["title"])
+    print("Sumber berita:", news["link"])
+
+    script, script_key = generate_script(news, history)
+
     print("Judul video:", script["title"])
-    print("Jumlah kata:", len(script["narration"].split()))
+    print("Kata narasi:", len(script["narration"].split()))
 
-    import asyncio
+    safe_title = re.sub(
+        r"[^a-zA-Z0-9_-]+", "_", script["title"]
+    ).strip("_")[:65] or "ftech_short"
 
     with tempfile.TemporaryDirectory() as temp:
         temp_dir = Path(temp)
         stock_path = temp_dir / "stock.mp4"
         audio_path = temp_dir / "voice.mp3"
+        final_path = OUTPUT_DIR / f"{safe_title}.mp4"
+        metadata_path = OUTPUT_DIR / f"{safe_title}.json"
 
-        safe_title = re.sub(
-            r"[^a-zA-Z0-9_-]+", "_", script["title"]
-        )[:70]
-        output_path = OUTPUT_DIR / f"{safe_title}.mp4"
-
-        download_pexels_video(
+        footage = find_pixabay_video(
             script["visual_query"], stock_path
         )
 
@@ -277,37 +312,44 @@ def main():
             script["narration"], audio_path
         ))
 
-        render_video(stock_path, audio_path, output_path)
+        duration = render_video(
+            stock_path, audio_path, final_path
+        )
 
         metadata = {
             "title": script["title"],
+            "narration": script["narration"],
+            "hashtags": script["hashtags"],
             "description": (
-                f"{script['narration']}\n\n"
-                f"Sumber berita: {news['link']}\n\n"
-                f"{script.get('hashtags', '#Teknologi #FTech')}"
+                script["narration"] + "\n\n"
+                + "Sumber berita: " + news["link"] + "\n"
+                + "Video stok: " + footage["page_url"] + "\n\n"
+                + " ".join(script["hashtags"])
             ),
             "source_url": news["link"],
-            "video_file": str(output_path),
+            "footage_page": footage["page_url"],
+            "duration_seconds": round(duration, 2),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "video_file": str(final_path),
         }
 
-        metadata_path = output_path.with_suffix(".json")
         metadata_path.write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
-        print("Video selesai dibuat:", output_path)
-        print("Metadata:", metadata_path)
+        print("Video selesai:", final_path)
+        print("Metadata selesai:", metadata_path)
+        print("Durasi:", round(duration, 2), "detik")
+        print("Halaman footage:", footage["page_url"])
 
-        if DRY_RUN:
-            print("DRY RUN: video belum diunggah ke YouTube.")
-            return
+    if DRY_RUN:
+        print("MODE UJI: belum mengunggah video ke YouTube.")
+        return
 
-        raise RuntimeError(
-            "Upload YouTube belum diaktifkan. "
-            "Jangan jalankan mode upload sebelum OAuth selesai."
-        )
-
+    raise RuntimeError(
+        "Upload belum diaktifkan. OAuth YouTube perlu disiapkan dahulu."
+    )
 
 if __name__ == "__main__":
     main()

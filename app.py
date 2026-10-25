@@ -38,7 +38,9 @@ TTS_VOICE = os.getenv("TTS_VOICE", "id-ID-ArdiNeural")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 MAX_GEMINI_ATTEMPTS = 5
+MAX_JSON_ATTEMPTS = 3
 MAX_HISTORY_ITEMS = 500
+
 MIN_DURATION = 30
 MAX_DURATION = 60
 
@@ -60,7 +62,7 @@ log = logging.getLogger("ftech")
 
 def fingerprint(value):
     normalized = re.sub(
-        r"\W+", " ", value.casefold()
+        r"\W+", " ", str(value).casefold()
     ).strip()
 
     return hashlib.sha256(
@@ -96,7 +98,8 @@ def load_history():
 
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise RuntimeError(
-            "history.json tidak valid. Periksa file sebelum melanjutkan."
+            "history.json tidak valid. Periksa file sebelum "
+            "melanjutkan agar riwayat anti-duplikasi tidak hilang."
         ) from exc
 
 
@@ -121,10 +124,48 @@ def remember(history, field, value):
 
 
 def safe_filename(title):
-    result = re.sub(r"[^\w-]+", "_", title, flags=re.UNICODE)
+    result = re.sub(
+        r"[^\w-]+", "_", title, flags=re.UNICODE
+    )
     result = result.strip("_")[:65]
 
     return result or "ftech_short"
+
+
+def extract_json_object(raw):
+    """Ambil objek JSON dari respons teks Gemini."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("Respons Gemini kosong.")
+
+    cleaned = raw.strip()
+
+    # Antisipasi jika model membungkus JSON dengan code fence.
+    cleaned = re.sub(
+        r"^\s*```(?:json)?\s*", "", cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+
+    # Pertama, coba parsing seluruh respons.
+    try:
+        result = json.loads(cleaned)
+        if isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # Cari objek JSON jika ada teks tambahan di luar objek.
+    start = cleaned.find("{")
+    if start < 0:
+        raise ValueError("Objek JSON tidak ditemukan.")
+
+    decoder = json.JSONDecoder()
+    result, _ = decoder.raw_decode(cleaned[start:])
+
+    if not isinstance(result, dict):
+        raise ValueError("Respons JSON bukan sebuah object.")
+
+    return result
 
 
 # ============================================================
@@ -134,6 +175,7 @@ def safe_filename(title):
 def get_news(history):
     used_articles = set(history["used_articles"])
     candidates = []
+    seen_links = set()
 
     for feed_url in RSS_FEEDS:
         try:
@@ -157,7 +199,9 @@ def get_news(history):
                     " ",
                     entry.get("summary", ""),
                 )
-                summary = re.sub(r"\s+", " ", summary).strip()
+                summary = re.sub(
+                    r"\s+", " ", summary
+                ).strip()
 
                 if not title or not link.startswith("https://"):
                     continue
@@ -166,6 +210,11 @@ def get_news(history):
 
                 if article_key in used_articles:
                     continue
+
+                if article_key in seen_links:
+                    continue
+
+                seen_links.add(article_key)
 
                 candidates.append({
                     "title": title,
@@ -183,7 +232,6 @@ def get_news(history):
             "Periksa RSS atau tunggu artikel baru."
         )
 
-    # Ambil kandidat pertama yang belum pernah dipakai.
     return candidates[0]
 
 
@@ -203,15 +251,14 @@ def gemini_request(prompt):
     payload = {
         "contents": [
             {
-                "parts": [
-                    {"text": prompt}
-                ]
+                "role": "user",
+                "parts": [{"text": prompt}],
             }
         ],
         "generationConfig": {
-            "temperature": 0.4,
+            "temperature": 0.3,
             "responseMimeType": "application/json",
-            "maxOutputTokens": 1200,
+            "maxOutputTokens": 2500,
         },
     }
 
@@ -235,7 +282,9 @@ def gemini_request(prompt):
                 )
 
                 if attempt < MAX_GEMINI_ATTEMPTS - 1:
-                    retry_after = response.headers.get("Retry-After")
+                    retry_after = response.headers.get(
+                        "Retry-After"
+                    )
                     delay = min(60, 2 ** (attempt + 1))
                     delay += random.uniform(0, 1.5)
 
@@ -275,7 +324,14 @@ def gemini_request(prompt):
 
             response.raise_for_status()
 
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Gemini mengembalikan respons HTTP yang "
+                    "bukan JSON valid."
+                ) from exc
+
             candidates = data.get("candidates", [])
 
             if not candidates:
@@ -285,19 +341,39 @@ def gemini_request(prompt):
                     f"Feedback: {feedback}"
                 )
 
-            parts = candidates[0].get("content", {}).get(
-                "parts", []
+            candidate = candidates[0]
+            finish_reason = candidate.get(
+                "finishReason", "UNKNOWN"
             )
+
+            parts = candidate.get(
+                "content", {}
+            ).get("parts", [])
 
             result = "".join(
                 part.get("text", "")
                 for part in parts
-                if "text" in part
+                if isinstance(part, dict)
+                and isinstance(part.get("text"), str)
             ).strip()
+
+            log.info(
+                "Gemini finishReason=%s; panjang respons=%s karakter.",
+                finish_reason,
+                len(result),
+            )
 
             if not result:
                 raise RuntimeError(
-                    "Respons Gemini kosong atau tidak berisi teks."
+                    "Respons Gemini kosong atau tidak berisi teks. "
+                    f"finishReason={finish_reason}"
+                )
+
+            if finish_reason == "MAX_TOKENS":
+                raise RuntimeError(
+                    "Respons Gemini terpotong karena batas token. "
+                    "Coba ringkas prompt atau gunakan model yang "
+                    "mendukung batas output lebih besar."
                 )
 
             return result
@@ -329,11 +405,14 @@ def gemini_request(prompt):
     )
 
 
+# ============================================================
+# GENERATE SCRIPT — RETRY JSON
+# ============================================================
+
 def generate_script(news, history):
     prompt = f"""
 Kamu adalah editor teknologi untuk channel YouTube Shorts F-Tech.
 
-TUGAS:
 Buat satu naskah orisinal berbahasa Indonesia untuk video
 teknologi berdurasi sekitar 30-60 detik.
 
@@ -347,21 +426,25 @@ ATURAN FAKTA:
 - Jangan mengarang angka, tanggal, hasil riset, atau kutipan.
 - Bedakan pengumuman perusahaan dengan fakta independen.
 - Jika ringkasan tidak cukup, gunakan bahasa berhati-hati.
-- Jangan menyatakan telah memverifikasi halaman penuh jika
-  hanya ringkasan RSS yang tersedia.
+- Jangan mengaku sudah memverifikasi halaman penuh jika hanya
+  ringkasan RSS yang tersedia.
 - Jangan menyalin kalimat artikel secara panjang.
 - Hindari klaim sensasional dan judul menyesatkan.
 
 ATURAN VIDEO:
-- Narasi 75-110 kata.
-- Bahasa alami untuk penonton Indonesia.
+- Narasi sekitar 75-95 kata.
+- Bahasa Indonesia alami dan enak didengar.
 - Pembuka menarik, isi jelas, penutup singkat.
 - Judul menarik tetapi tidak menyesatkan.
-- visual_query harus spesifik dan relevan dengan berita.
-- Hashtag maksimal 5.
-- Hindari mengulang narasi atau judul yang pernah digunakan.
+- visual_query berupa pencarian footage dalam bahasa Inggris.
+- Maksimal 5 hashtag.
+- Hindari mengulang narasi atau judul yang sudah digunakan.
 
-Balas hanya JSON valid dengan struktur:
+BALAS HANYA JSON VALID. Jangan pakai markdown atau code fence.
+Pastikan semua string dan kurung ditutup dengan benar.
+Jangan memasukkan baris baru mentah di dalam string JSON.
+
+Struktur wajib:
 {{
   "title": "Judul Shorts",
   "narration": "Narasi lengkap",
@@ -370,14 +453,46 @@ Balas hanya JSON valid dengan struktur:
 }}
 """
 
-    raw = gemini_request(prompt)
+    last_error = None
+    script = None
 
-    try:
-        script = json.loads(raw)
-    except json.JSONDecodeError as exc:
+    for attempt in range(MAX_JSON_ATTEMPTS):
+        current_prompt = prompt
+
+        if attempt > 0:
+            current_prompt += f"""
+
+PERCOBAAN ULANG {attempt + 1}/{MAX_JSON_ATTEMPTS}.
+Respons sebelumnya gagal diparsing. Buat ulang seluruh jawaban.
+Jangan melanjutkan potongan jawaban sebelumnya.
+Buat JSON lengkap dan valid, bukan teks penjelasan.
+Narasi sekitar 75-85 kata agar respons ringkas.
+Pastikan title, narration, visual_query, dan hashtags lengkap.
+"""
+
+        raw = gemini_request(current_prompt)
+
+        try:
+            script = extract_json_object(raw)
+            break
+
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+            log.warning(
+                "JSON Gemini tidak valid pada percobaan %s/%s: %s. "
+                "Awal respons: %s",
+                attempt + 1,
+                MAX_JSON_ATTEMPTS,
+                exc,
+                raw[:180].replace("\n", " "),
+            )
+
+    if script is None:
         raise RuntimeError(
-            f"Gemini tidak mengembalikan JSON valid: {raw[:300]}"
-        ) from exc
+            "Gemini gagal menghasilkan JSON valid setelah "
+            f"{MAX_JSON_ATTEMPTS} percobaan. "
+            f"Kesalahan terakhir: {last_error}"
+        )
 
     required = (
         "title",
@@ -394,27 +509,39 @@ Balas hanya JSON valid dengan struktur:
 
     script["title"] = str(script["title"]).strip()
     script["narration"] = str(script["narration"]).strip()
-    script["visual_query"] = str(script["visual_query"]).strip()
+    script["visual_query"] = str(
+        script["visual_query"]
+    ).strip()
 
-    if isinstance(script["hashtags"], str):
-        script["hashtags"] = script["hashtags"].split()
+    hashtags = script["hashtags"]
+
+    if isinstance(hashtags, str):
+        hashtags = hashtags.split()
+
+    if not isinstance(hashtags, list):
+        raise RuntimeError(
+            "Kolom hashtags harus berupa array atau daftar teks."
+        )
 
     script["hashtags"] = [
         str(tag).strip()
-        for tag in script["hashtags"]
+        for tag in hashtags
         if str(tag).strip()
     ][:5]
+
+    if not script["title"] or not script["visual_query"]:
+        raise RuntimeError(
+            "Judul atau visual_query dari Gemini kosong."
+        )
+
+    if not script["narration"]:
+        raise RuntimeError("Narasi dari Gemini kosong.")
 
     words = script["narration"].split()
 
     if not 65 <= len(words) <= 135:
         raise RuntimeError(
             f"Narasi berisi {len(words)} kata; target 65-135 kata."
-        )
-
-    if not script["title"] or not script["visual_query"]:
-        raise RuntimeError(
-            "Judul atau visual_query dari Gemini kosong."
         )
 
     script_key = fingerprint(script["narration"])
@@ -451,17 +578,26 @@ def download_pixabay_video(query, destination):
     seen_ids = set()
 
     for search_query in search_variants:
-        response = requests.get(
-            url,
-            params={
-                "key": PIXABAY_API_KEY,
-                "q": search_query,
-                "safesearch": "true",
-                "per_page": 20,
-            },
-            timeout=45,
-        )
-        response.raise_for_status()
+        try:
+            response = requests.get(
+                url,
+                params={
+                    "key": PIXABAY_API_KEY,
+                    "q": search_query,
+                    "safesearch": "true",
+                    "per_page": 20,
+                },
+                timeout=45,
+            )
+            response.raise_for_status()
+
+        except requests.RequestException as exc:
+            log.warning(
+                "Pencarian Pixabay gagal untuk '%s': %s",
+                search_query,
+                exc,
+            )
+            continue
 
         for hit in response.json().get("hits", []):
             video_id = hit.get("id")
@@ -514,7 +650,8 @@ def download_pixabay_video(query, destination):
 
                 except requests.RequestException as exc:
                     log.warning(
-                        "Gagal mengunduh footage: %s", exc
+                        "Gagal mengunduh footage Pixabay: %s",
+                        exc,
                     )
                     destination.unlink(missing_ok=True)
 
@@ -590,7 +727,10 @@ def render_video(video_path, audio_path, destination):
 
     subprocess.run(command, check=True)
 
-    if not destination.exists() or destination.stat().st_size < 50_000:
+    if (
+        not destination.exists()
+        or destination.stat().st_size < 50_000
+    ):
         raise RuntimeError(
             "FFmpeg tidak menghasilkan video yang valid."
         )
@@ -712,21 +852,24 @@ def main():
     save_history(history)
 
     log.info("Video selesai dibuat: %s", final_path)
-    log.info("Metadata selesai dibuat: %s", metadata_path)
+    log.info("Metadata tersimpan: %s", metadata_path)
     log.info("Durasi video: %.2f detik", duration)
 
     if DRY_RUN:
         log.info(
-            "DRY RUN aktif. Video belum diunggah ke YouTube."
+            "DRY_RUN=true: video dibuat tetapi belum diunggah "
+            "ke YouTube."
         )
-        return
-
-    raise RuntimeError(
-        "Upload YouTube belum diaktifkan. "
-        "Gunakan DRY_RUN=true sampai OAuth dan uploader "
-        "sudah disiapkan serta diuji."
-    )
+    else:
+        raise RuntimeError(
+            "Upload YouTube belum diimplementasikan. "
+            "Gunakan DRY_RUN=true sampai fitur upload ditambahkan."
+        )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        log.exception("Workflow F-Tech Shorts gagal.")
+        raise
